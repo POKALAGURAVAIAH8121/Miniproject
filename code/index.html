@@ -1,10 +1,856 @@
-<html>
-  <head>
-    <title>
-      My Project
-    </title>
-  </head>
-  <body>
-    <h1> My Project </h1>
-  </body>
-</html>
+# --- backend/RideShareBlockchainAPI.py ---
+import hashlib
+import json
+from time import time
+from uuid import uuid4
+from pathlib import Path
+
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+# -------------------------
+# Audit log (JSON lines) -> blockchain_audit.txt
+# -------------------------
+AUDIT_FILE = Path(__file__).parent / 'blockchain_audit.txt'
+
+def audit_log(event, data):
+    """
+    Append a JSON line: {"ts": <unix>, "event": "<EVENT>", "data": {...}}
+    """
+    try:
+        rec = {"ts": time(), "event": str(event), "data": data}
+        with open(AUDIT_FILE, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+    except Exception:
+        # fail-soft: do not crash the node due to logging
+        pass
+
+# -------------------------
+# Utilities: reputation
+# -------------------------
+def calculate_reputation_impact(current_reputation, rating, transaction_fare):
+    """
+    Calculates the impact of a rating on reputation (bounded 1.0..5.0).
+    Slightly scales by fare so higher-fare trips weigh more.
+    """
+    base_adjustment = (rating - 3.0) * 0.1
+    fare_scale = 1 + (transaction_fare / 150.0)
+    new_rep = current_reputation + (base_adjustment * fare_scale)
+    new_rep = max(1.0, min(5.0, new_rep))
+    impact = new_rep - current_reputation
+    return new_rep, impact
+
+# -------------------------
+# In-memory notifications
+# -------------------------
+notifications = []  # each: {id, user_id, ts, message, tx_id, type}
+
+def push_notification(user_id, message, tx_id=None, type_="info"):
+    note = {
+        "id": str(uuid4()),
+        "user_id": user_id,
+        "ts": time(),
+        "message": message,
+        "tx_id": tx_id,
+        "type": type_,
+    }
+    notifications.append(note)
+    audit_log("NOTIFICATION", note)
+
+# -------------------------
+# Blockchain
+# -------------------------
+class Blockchain:
+    def __init__(self):
+        self.chain = []
+        self.current_transactions = []
+        self.reputation_ledger = {}  # user_id -> score
+
+        # Genesis only (single default block)
+        self.new_block(proof=100, previous_hash='1')
+        audit_log("GENESIS_CREATED", {"index": self.chain[-1]['index'], "hash": self.chain[-1]['hash']})
+
+    def new_block(self, proof, previous_hash=None):
+        """
+        Create a new Block in the chain.
+        """
+        block = {
+            'index': len(self.chain) + 1,
+            'timestamp': time(),
+            'transactions': self.current_transactions,
+            'proof': proof,
+            'previous_hash': previous_hash or (self.hash(self.chain[-1]) if self.chain else '1'),
+        }
+
+        # Reset the current list of transactions
+        self.current_transactions = []
+
+        # Calculate the final block hash
+        block['hash'] = self.hash(block)
+        self.chain.append(block)
+
+        # Audit the block
+        audit_log("BLOCK_MINED", {
+            "index": block['index'],
+            "hash": block['hash'],
+            "prev": block['previous_hash'],
+            "proof": block['proof'],
+            "tx_count": len(block['transactions']),
+        })
+        # Audit each transaction included
+        for tx in block['transactions']:
+            audit_log("TX_MINED", tx)
+
+        # Update reputation for completed trips in this block
+        self._process_mined_transactions(block['transactions'])
+        return block
+
+    def new_transaction(
+        self,
+        rider_id,
+        driver_id,
+        fare,
+        destination,
+        signature,
+        status='ESCROW_PENDING',
+        rider_mobile=None,
+        **kwargs
+    ):
+        """
+        Create a new transaction to go into the next mined block.
+        """
+        tx_id = str(uuid4())
+        transaction = {
+            'transaction_id': tx_id,
+            'rider_id': rider_id,
+            'driver_id': driver_id,
+            'fare': fare,
+            'destination': destination,
+            'signature': signature,
+            'timestamp': time(),
+            'status': status,
+            'rider_mobile': rider_mobile,
+            'rider_rating': kwargs.get('rider_rating'),
+            'driver_rating': kwargs.get('driver_rating'),
+            'original_tx_id': kwargs.get('original_tx_id'),
+        }
+        self.current_transactions.append(transaction)
+        audit_log("TX_NEW", transaction)
+        return tx_id
+
+    def _process_mined_transactions(self, transactions):
+        """
+        After a block is mined, update reputation for COMPLETED trips.
+        """
+        for tx in transactions:
+            if tx.get('status') == 'ESCROW_RELEASED_COMPLETED':
+                rider_id = tx['rider_id']
+                driver_id = tx['driver_id']
+                fare = tx['fare']
+
+                # rating given by rider to driver -> affects driver's reputation
+                driver_rating = tx.get('rider_rating')
+                if driver_rating is not None:
+                    dr_rep = self.reputation_ledger.get(driver_id, 3.0)
+                    new_rep, impact = calculate_reputation_impact(dr_rep, driver_rating, fare)
+                    self.reputation_ledger[driver_id] = new_rep
+                    audit_log("REPUTATION_UPDATE", {
+                        "user_id": driver_id, "role": "driver",
+                        "rating": driver_rating, "fare": fare,
+                        "old": dr_rep, "new": new_rep, "impact": impact
+                    })
+
+                # rating given by driver to rider -> affects rider's reputation
+                rider_rating = tx.get('driver_rating')
+                if rider_rating is not None:
+                    rr_rep = self.reputation_ledger.get(rider_id, 3.0)
+                    new_rep, impact = calculate_reputation_impact(rr_rep, rider_rating, fare)
+                    self.reputation_ledger[rider_id] = new_rep
+                    audit_log("REPUTATION_UPDATE", {
+                        "user_id": rider_id, "role": "rider",
+                        "rating": rider_rating, "fare": fare,
+                        "old": rr_rep, "new": new_rep, "impact": impact
+                    })
+
+    @property
+    def last_block(self):
+        return self.chain[-1] if self.chain else None
+
+    @staticmethod
+    def hash(block):
+        """
+        SHA-256 hash of a block.
+        """
+        block_string = json.dumps(block, sort_keys=True).encode()
+        return hashlib.sha256(block_string).hexdigest()
+
+    def proof_of_authority(self, last_proof):
+        """
+        Simple PoA stub: next integer.
+        """
+        return last_proof + 1
+
+    def find_transaction_by_id(self, tx_id):
+        """
+        Search the entire chain and current pool for a transaction by id.
+        """
+        for block in self.chain:
+            for tx in block['transactions']:
+                if tx.get('transaction_id') == tx_id:
+                    return tx
+        for tx in self.current_transactions:
+            if tx.get('transaction_id') == tx_id:
+                return tx
+        return None
+
+# -------------------------
+# Flask app
+# -------------------------
+app = Flask(__name__)
+CORS(app)
+blockchain = Blockchain()
+
+@app.route('/mine', methods=['GET'])
+def mine():
+    # Mine a block (simple PoA)
+    last_block = blockchain.last_block
+    last_proof = last_block['proof']
+    proof = blockchain.proof_of_authority(last_proof)
+    previous_hash = blockchain.hash(last_block)
+    block = blockchain.new_block(proof, previous_hash)
+
+    # Fire notifications per tx status found in the mined block
+    for tx in block['transactions']:
+        if tx.get('status') == 'ESCROW_PENDING':
+            push_notification(tx['rider_id'], "Your ride request is confirmed in a block.", tx['transaction_id'], "status")
+        elif tx.get('status') == 'RIDE_ACCEPTED_IN_PROGRESS':
+            push_notification(tx['rider_id'], "Your ride has been accepted. Driver en route!", tx['transaction_id'], "status")
+            push_notification(tx['driver_id'], "You accepted a ride. It's in progress.", tx['transaction_id'], "status")
+        elif tx.get('status') == 'ESCROW_RELEASED_COMPLETED':
+            push_notification(tx['rider_id'], "Trip completed. Thanks for riding!", tx['transaction_id'], "status")
+            push_notification(tx['driver_id'], "Trip completed. Fare released.", tx['transaction_id'], "status")
+
+    audit_log("CHAIN_LENGTH", {"length": len(blockchain.chain)})
+
+    response = {
+        'message': 'New Block Forged',
+        'index': block['index'],
+        'transactions': block['transactions'],
+        'proof': block['proof'],
+        'previous_hash': block['previous_hash'],
+        'hash': block['hash'],
+    }
+    return jsonify(response), 200
+
+@app.route('/transactions/new', methods=['POST'])
+def new_transaction():
+    values = request.get_json(force=True)
+    required = ['rider_id', 'driver_id', 'fare', 'destination', 'signature', 'rider_mobile']
+    if not all(k in values for k in required):
+        audit_log("ERROR_TX_NEW_MISSING_VALUES", {"received": values})
+        return jsonify({'message': 'Missing values'}), 400
+
+    tx_id = blockchain.new_transaction(
+        rider_id=values['rider_id'],
+        driver_id=values['driver_id'],
+        fare=values['fare'],
+        destination=values['destination'],
+        signature=values['signature'],
+        status='ESCROW_PENDING',
+        rider_mobile=values['rider_mobile'],
+    )
+
+    push_notification(values['rider_id'], "Ride request placed successfully.", tx_id, "info")
+    audit_log("TX_NEW_ACK", {"transaction_id": tx_id})
+
+    return jsonify({'message': f'Transaction will be added to Block with ID: {tx_id}', 'transaction_id': tx_id}), 201
+
+@app.route('/transactions/pending', methods=['GET'])
+def get_pending_transactions():
+    # Current pool
+    pending_requests = [tx for tx in blockchain.current_transactions if tx.get('status') == 'ESCROW_PENDING']
+    # Last block (in case something was mined but still pending)
+    if blockchain.chain:
+        last_block_tx = blockchain.chain[-1].get('transactions', [])
+        for tx in last_block_tx:
+            if tx.get('status') == 'ESCROW_PENDING':
+                pending_requests.append(tx)
+    # De-duplicate by tx id
+    seen = set()
+    unique_requests = []
+    for tx in pending_requests:
+        if tx['transaction_id'] not in seen:
+            unique_requests.append(tx)
+            seen.add(tx['transaction_id'])
+    audit_log("PENDING_REQUESTS_RETURNED", {"count": len(unique_requests)})
+    return jsonify({'transactions': unique_requests}), 200
+
+@app.route('/ride/accept', methods=['POST'])
+def accept_ride():
+    values = request.get_json(force=True)
+    required = ['transaction_id', 'driver_id']
+    if not all(k in values for k in required):
+        audit_log("ERROR_RIDE_ACCEPT_MISSING", {"received": values})
+        return jsonify({"message": "Missing transaction_id or driver_id"}), 400
+
+    tx_id = values['transaction_id']
+    driver_id = values['driver_id']
+
+    original_tx = blockchain.find_transaction_by_id(tx_id)
+    if not original_tx or original_tx.get('status') != 'ESCROW_PENDING':
+        audit_log("ERROR_RIDE_ACCEPT_NOT_FOUND", {"tx_id": tx_id})
+        return jsonify({"message": f"Ride request {tx_id[:8]} not found or already accepted/completed."}), 404
+
+    new_tx_id = blockchain.new_transaction(
+        rider_id=original_tx['rider_id'],
+        driver_id=driver_id,
+        fare=original_tx['fare'],
+        destination=original_tx['destination'],
+        signature=f'0xDRIVER_ACCEPTANCE_OF_{tx_id}',
+        status='RIDE_ACCEPTED_IN_PROGRESS',
+        rider_mobile=original_tx.get('rider_mobile'),
+        original_tx_id=tx_id,
+    )
+
+    push_notification(original_tx['rider_id'], "Driver accepted your ride.", new_tx_id, "status")
+    push_notification(driver_id, "You accepted a ride request.", new_tx_id, "status")
+    audit_log("RIDE_ACCEPTED", {"original_tx_id": tx_id, "new_tx_id": new_tx_id, "driver_id": driver_id})
+
+    return jsonify({
+        'message': f'Ride acceptance submitted as new TX {new_tx_id[:8]}. Waiting for block confirmation.',
+        'transaction_id': new_tx_id
+    }), 200
+
+@app.route('/ride/complete', methods=['POST'])
+def complete_ride():
+    values = request.get_json(force=True)
+    required = ['transaction_id', 'rider_rating', 'driver_rating']
+    if not all(k in values for k in required):
+        audit_log("ERROR_RIDE_COMPLETE_MISSING", {"received": values})
+        return jsonify({"message": "Missing transaction_id or ratings"}), 400
+
+    tx_id = values['transaction_id']
+    rider_rating = values['rider_rating']      # rider -> driver
+    driver_rating = values['driver_rating']    # driver -> rider
+
+    original_tx = blockchain.find_transaction_by_id(tx_id)
+    if not original_tx or original_tx.get('status') != 'RIDE_ACCEPTED_IN_PROGRESS':
+        audit_log("ERROR_RIDE_COMPLETE_NOT_FOUND", {"tx_id": tx_id})
+        return jsonify({"message": f"Active ride {tx_id[:8]} not found or not in progress."}), 404
+
+    new_tx_id = blockchain.new_transaction(
+        rider_id=original_tx['rider_id'],
+        driver_id=original_tx['driver_id'],
+        fare=original_tx['fare'],
+        destination=original_tx['destination'],
+        signature=f'0xTRIP_COMPLETION_OF_{tx_id}',
+        status='ESCROW_RELEASED_COMPLETED',
+        rider_mobile=original_tx.get('rider_mobile'),
+        rider_rating=rider_rating,
+        driver_rating=driver_rating,
+        original_tx_id=tx_id,
+    )
+
+    push_notification(original_tx['rider_id'], "Ride completed. Please check your receipt.", new_tx_id, "status")
+    push_notification(original_tx['driver_id'], "Ride completed. Fare released to you.", new_tx_id, "status")
+    audit_log("RIDE_COMPLETED", {
+        "original_tx_id": tx_id,
+        "new_tx_id": new_tx_id,
+        "ratings": {"rider_to_driver": rider_rating, "driver_to_rider": driver_rating}
+    })
+
+    return jsonify({
+        'message': f'Trip completion submitted as new TX {new_tx_id[:8]}. Waiting for block confirmation.',
+        'transaction_id': new_tx_id
+    }), 200
+
+@app.route('/driver/active_ride/<driver_id>', methods=['GET'])
+def get_driver_active_ride(driver_id):
+    """
+    Returns the driver's most recent ride transaction (from pool + chain),
+    along with a normalized 'stage': REQUESTED | ACCEPTED | COMPLETED.
+    Symmetric with rider endpoint so both UIs stay in sync immediately.
+    """
+    candidates = []
+
+    # 1) Pending pool first (so ACCEPTED/COMPLETED show up before mining)
+    for tx in blockchain.current_transactions:
+        if tx.get('driver_id') == driver_id:
+            candidates.append(tx)
+
+    # 2) Entire chain in reverse (most recent first)
+    for block in reversed(blockchain.chain):
+        for tx in block.get('transactions', []):
+            if tx.get('driver_id') == driver_id:
+                candidates.append(tx)
+
+    if not candidates:
+        return jsonify({'latest_ride': None, 'stage': None}), 200
+
+    # Most recent by timestamp
+    candidates.sort(key=lambda t: t.get('timestamp', 0), reverse=True)
+    latest = candidates[0]
+    status = latest.get('status', '')
+
+    if status == 'RIDE_ACCEPTED_IN_PROGRESS':
+        stage = 'ACCEPTED'
+    elif status == 'ESCROW_RELEASED_COMPLETED':
+        stage = 'COMPLETED'
+    else:
+        stage = 'REQUESTED'
+
+    return jsonify({'latest_ride': latest, 'stage': stage}), 200
+
+@app.route('/rider/active_ride/<rider_id>', methods=['GET'])
+def get_rider_active_ride(rider_id):
+    """
+    Returns the rider's most recent ride transaction (from pool + chain),
+    along with a normalized 'stage': REQUESTED | ACCEPTED | COMPLETED.
+    """
+    candidates = []
+
+    # 1) Scan current pending pool (captures acceptance/completion before mining)
+    for tx in blockchain.current_transactions:
+        if tx.get('rider_id') == rider_id:
+            candidates.append(tx)
+
+    # 2) Scan the chain in reverse (most recent first)
+    for block in reversed(blockchain.chain):
+        for tx in block.get('transactions', []):
+            if tx.get('rider_id') == rider_id:
+                candidates.append(tx)
+
+    if not candidates:
+        audit_log("RIDER_ACTIVE_RIDE_NONE", {"rider_id": rider_id})
+        return jsonify({'latest_ride': None, 'stage': None}), 200
+
+    # Pick the most recent by timestamp
+    candidates.sort(key=lambda t: t.get('timestamp', 0), reverse=True)
+    latest = candidates[0]
+    status = latest.get('status', '')
+
+    if status == 'RIDE_ACCEPTED_IN_PROGRESS':
+        stage = 'ACCEPTED'
+    elif status == 'ESCROW_RELEASED_COMPLETED':
+        stage = 'COMPLETED'
+    else:
+        stage = 'REQUESTED'  # includes ESCROW_PENDING
+
+    audit_log("RIDER_ACTIVE_RIDE", {"rider_id": rider_id, "stage": stage, "tx_id": latest.get('transaction_id')})
+    return jsonify({'latest_ride': latest, 'stage': stage}), 200
+
+@app.route('/chain', methods=['GET'])
+def chain():
+    audit_log("CHAIN_FETCHED", {"length": len(blockchain.chain)})
+    return jsonify({'chain': blockchain.chain, 'length': len(blockchain.chain)}), 200
+
+@app.route('/reputation/<user_id>', methods=['GET'])
+def get_reputation(user_id):
+    rep = blockchain.reputation_ledger.get(user_id, 3.0)
+    audit_log("REPUTATION_FETCHED", {"user_id": user_id, "reputation": rep})
+    return jsonify({'user_id': user_id, 'reputation': rep}), 200
+
+@app.route('/notifications/<user_id>', methods=['GET'])
+def get_notifications(user_id):
+    user_notes = [n for n in notifications if n['user_id'] == user_id]
+    audit_log("NOTIFICATIONS_FETCHED", {"user_id": user_id, "count": len(user_notes)})
+    return jsonify({'notifications': user_notes}), 200
+
+@app.route('/notifications/clear/<user_id>', methods=['POST'])
+def clear_notifications(user_id):
+    global notifications
+    before = len(notifications)
+    notifications = [n for n in notifications if n['user_id'] != user_id]
+    audit_log("NOTIFICATIONS_CLEARED", {"user_id": user_id, "removed": before - len(notifications)})
+    return jsonify({'message': 'Cleared'}), 200
+
+if __name__ == '__main__':
+    # Only the genesis block exists by default.
+    app.run(host='127.0.0.1', port=5000, debug=True)
+
+
+
+
+
+
+
+
+
+
+  import hashlib
+import json
+from time import time
+from urllib.parse import urlparse
+from uuid import uuid4
+
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+# --- Utility Functions ---
+
+def calculate_reputation_impact(current_reputation, rating, transaction_fare):
+    """
+    Calculates the impact of a rating on reputation.
+    
+    The impact is scaled based on the fare amount, where higher-fare trips
+    have a slightly larger reputation weight.
+    """
+    # Base reputation adjustment (e.g., +0.2 for a 5-star trip, -0.3 for a 1-star trip)
+    # The multiplier is (rating - 3) to give positive/negative weight around a 3.0 baseline
+    base_adjustment = (rating - 3.0) * 0.1 
+    
+    # Scale factor based on fare (e.g., fare of 15 gives factor ~1.1, fare of 25 gives factor ~1.2)
+    # This slightly increases the impact for more significant transactions.
+    fare_scale = 1 + (transaction_fare / 150) 
+
+    # Total impact is the scaled adjustment
+    impact = base_adjustment * fare_scale
+    
+    # New reputation is capped between 1.0 and 5.0
+    new_reputation = max(1.0, min(5.0, current_reputation + impact))
+    
+    return new_reputation, impact
+
+# --- Blockchain and Node Class ---
+
+class Blockchain:
+    def __init__(self):
+        self.chain = []
+        self.current_transactions = []
+        self.reputation_ledger = {}  # { user_id: reputation_score }
+
+        # Create the genesis block
+        self.new_block(proof=100, previous_hash='1')
+
+    def new_block(self, proof, previous_hash=None):
+        """
+        Create a new Block in the Blockchain
+        :param proof: The proof given by the Proof of Work algorithm (PoA in this case)
+        :param previous_hash: Hash of previous Block
+        :return: New Block
+        """
+        block = {
+            'index': len(self.chain) + 1,
+            'timestamp': time(),
+            'transactions': self.current_transactions,
+            'proof': proof,
+            'previous_hash': previous_hash or self.hash(self.chain[-1]) if self.chain else '1',
+        }
+
+        # Clear the current list of transactions
+        self.current_transactions = []
+        
+        # Calculate the block's hash now that all content is finalized
+        block['hash'] = self.hash(block)
+
+        self.chain.append(block)
+        
+        # Process transactions for reputation update (only upon mining)
+        self._process_mined_transactions(block['transactions'])
+        
+        return block
+
+    def new_transaction(self, rider_id, driver_id, fare, destination, signature, status='ESCROW_PENDING', **kwargs):
+        """
+        Creates a new transaction to go into the next mined Block
+        :param rider_id: ID of the Rider
+        :param driver_id: ID of the Driver (PENDING_DRIVER initially)
+        :param fare: Amount of the fare
+        :param destination: Destination of the ride
+        :param status: Initial status (ESCROW_PENDING)
+        :param kwargs: Additional fields like rating
+        :return: The index of the Block that will hold this transaction
+        """
+        tx_id = str(uuid4())
+        transaction = {
+            'transaction_id': tx_id,
+            'rider_id': rider_id,
+            'driver_id': driver_id,
+            'fare': fare,
+            'destination': destination,
+            'signature': signature,
+            'timestamp': time(),
+            'status': status,
+            # Placeholder for ratings (only used in completion TX)
+            'rider_rating': kwargs.get('rider_rating'), 
+            'driver_rating': kwargs.get('driver_rating'),
+        }
+
+        self.current_transactions.append(transaction)
+        
+        return tx_id
+
+    def _process_mined_transactions(self, transactions):
+        """
+        Processes transactions in a newly mined block, updating the reputation ledger.
+        This handles the state machine: only completed transactions update reputation.
+        """
+        for tx in transactions:
+            if tx.get('status') == 'ESCROW_RELEASED_COMPLETED':
+                rider_id = tx['rider_id']
+                driver_id = tx['driver_id']
+                fare = tx['fare']
+                
+                # driver_rating is the rating given to the rider
+                rider_rating_given_to_driver = tx['driver_rating']
+                # rider_rating is the rating given to the driver
+                driver_rating_given_to_rider = tx['rider_rating'] 
+
+                # 1. Update DRIVER's reputation based on the rating given by the RIDER (driver_rating)
+                if driver_id != 'PENDING_DRIVER' and rider_rating_given_to_driver is not None:
+                    driver_rep = self.reputation_ledger.get(driver_id, 3.0)
+                    new_rep, impact = calculate_reputation_impact(driver_rep, rider_rating_given_to_driver, fare)
+                    self.reputation_ledger[driver_id] = new_rep
+                    print(f"Reputation updated: Driver {driver_id} updated by Rider ({rider_rating_given_to_driver} stars), Impact: {impact:.3f}, New Rep: {new_rep:.2f}")
+
+                # 2. Update RIDER's reputation based on the rating given by the DRIVER (rider_rating)
+                if driver_rating_given_to_rider is not None:
+                    rider_rep = self.reputation_ledger.get(rider_id, 3.0)
+                    new_rep, impact = calculate_reputation_impact(rider_rep, driver_rating_given_to_rider, fare)
+                    self.reputation_ledger[rider_id] = new_rep
+                    print(f"Reputation updated: Rider {rider_id} updated by Driver ({driver_rating_given_to_rider} stars), Impact: {impact:.3f}, New Rep: {new_rep:.2f}")
+
+
+    @property
+    def last_block(self):
+        return self.chain[-1] if self.chain else None
+
+    @staticmethod
+    def hash(block):
+        """
+        Creates a SHA-256 hash of a Block
+        :param block: Block
+        :return: string
+        """
+        # We must ensure that the Dictionary is Ordered, or we'll have inconsistent hashes
+        block_string = json.dumps(block, sort_keys=True).encode()
+        return hashlib.sha256(block_string).hexdigest()
+
+    def proof_of_authority(self, last_proof):
+        """
+        Simple Proof-of-Authority (PoA) consensus mechanism.
+        The proof is just an incrementing number until the Authority Node accepts it.
+        """
+        proof = last_proof + 1
+        return proof
+    
+    def find_transaction_by_id(self, tx_id):
+        """Searches the entire chain for a transaction by ID."""
+        for block in self.chain:
+            for tx in block['transactions']:
+                if tx.get('transaction_id') == tx_id:
+                    return tx
+        return None
+
+# Instantiate the Node
+app = Flask(__name__)
+CORS(app)
+
+# Generate a globally unique address for this node
+node_identifier = str(uuid4()).replace('-', '')
+
+# Instantiate the Blockchain
+blockchain = Blockchain()
+
+# --- API Endpoints ---
+
+@app.route('/mine', methods=['GET'])
+def mine():
+    # We run the simple 'proof of authority' algorithm to get the next proof
+    last_block = blockchain.last_block
+    last_proof = last_block['proof']
+    proof = blockchain.proof_of_authority(last_proof)
+
+    # For a simple demo, we don't need a reward transaction, but we create the block
+    previous_hash = blockchain.hash(last_block)
+    block = blockchain.new_block(proof, previous_hash)
+
+    response = {
+        'message': "New Block Forged",
+        'index': block['index'],
+        'transactions': block['transactions'],
+        'proof': block['proof'],
+        'previous_hash': block['previous_hash'],
+        'hash': block['hash']
+    }
+    return jsonify(response), 200
+
+@app.route('/transactions/new', methods=['POST'])
+def new_transaction():
+    values = request.get_json()
+
+    # Check that the required fields are in the POST'ed data
+    required = ['rider_id', 'driver_id', 'fare', 'destination', 'signature']
+    if not all(k in values for k in required):
+        return 'Missing values', 400
+
+    # Create a new Transaction
+    tx_id = blockchain.new_transaction(
+        values['rider_id'],
+        values['driver_id'],
+        values['fare'],
+        values['destination'],
+        values['signature'],
+        status='ESCROW_PENDING'
+    )
+
+    response = {'message': f'Transaction will be added to Block with ID: {tx_id}'}
+    return jsonify(response), 201
+
+@app.route('/transactions/pending', methods=['GET'])
+def get_pending_transactions():
+    """
+    Returns all transactions that are open ride requests (ESCROW_PENDING).
+    It checks both the pending pool and the last mined block.
+    """
+    
+    # 1. Check the current pool
+    pending_requests = [
+        tx for tx in blockchain.current_transactions if tx.get('status') == 'ESCROW_PENDING'
+    ]
+    
+    # 2. Check the last mined block for unaccepted requests (this is the fix)
+    if blockchain.chain:
+        last_block_transactions = blockchain.chain[-1].get('transactions', [])
+        for tx in last_block_transactions:
+            # Add transactions that are mined but still in PENDING status
+            if tx.get('status') == 'ESCROW_PENDING':
+                pending_requests.append(tx)
+
+    # Filter out duplicates (important if the same TX is somehow in the pool and the block)
+    seen_tx_ids = set()
+    unique_requests = []
+    for tx in pending_requests:
+        if tx['transaction_id'] not in seen_tx_ids:
+            unique_requests.append(tx)
+            seen_tx_ids.add(tx['transaction_id'])
+            
+    return jsonify({'transactions': unique_requests}), 200
+
+@app.route('/ride/accept', methods=['POST'])
+def accept_ride():
+    values = request.get_json()
+    required = ['transaction_id', 'driver_id']
+    if not all(k in values for k in required):
+        return jsonify({"message": "Missing transaction_id or driver_id"}), 400
+
+    tx_id = values['transaction_id']
+    driver_id = values['driver_id']
+    
+    # 1. Find the original ESCROW_PENDING transaction in the chain
+    original_tx = blockchain.find_transaction_by_id(tx_id)
+    if not original_tx or original_tx.get('status') != 'ESCROW_PENDING':
+        return jsonify({"message": f"Ride request {tx_id[:8]} not found or already accepted/completed."}), 404
+        
+    # 2. Create a NEW transaction to signal acceptance
+    # This new transaction confirms the driver_id and updates the status
+    new_tx_id = blockchain.new_transaction(
+        rider_id=original_tx['rider_id'],
+        driver_id=driver_id,
+        fare=original_tx['fare'],
+        destination=original_tx['destination'],
+        signature=f'0xDRIVER_ACCEPTANCE_OF_{tx_id}', # New signature for the driver
+        status='RIDE_ACCEPTED_IN_PROGRESS',
+        # Link the new transaction to the old one for easy tracking
+        original_tx_id=tx_id
+    )
+    
+    response = {
+        'message': f'Ride acceptance for TX {tx_id[:8]} submitted to the pool as new TX {new_tx_id[:8]}. Waiting for block confirmation.',
+        'transaction_id': new_tx_id
+    }
+    return jsonify(response), 200
+
+@app.route('/ride/complete', methods=['POST'])
+def complete_ride():
+    values = request.get_json()
+    required = ['transaction_id', 'rider_rating', 'driver_rating']
+    if not all(k in values for k in required):
+        return jsonify({"message": "Missing transaction_id or ratings"}), 400
+
+    tx_id = values['transaction_id']
+    rider_rating = values['rider_rating']  # Rating given to the driver
+    driver_rating = values['driver_rating'] # Rating given to the rider
+    
+    # 1. Find the original RIDE_ACCEPTED_IN_PROGRESS transaction in the chain
+    original_tx = blockchain.find_transaction_by_id(tx_id)
+    if not original_tx or original_tx.get('status') != 'RIDE_ACCEPTED_IN_PROGRESS':
+        return jsonify({"message": f"Active ride {tx_id[:8]} not found or not in progress."}), 404
+        
+    # 2. Create a FINAL transaction to signal completion, rating, and escrow release
+    new_tx_id = blockchain.new_transaction(
+        rider_id=original_tx['rider_id'],
+        driver_id=original_tx['driver_id'],
+        fare=original_tx['fare'],
+        destination=original_tx['destination'],
+        signature=f'0xTRIP_COMPLETION_OF_{tx_id}', 
+        status='ESCROW_RELEASED_COMPLETED',
+        rider_rating=rider_rating,
+        driver_rating=driver_rating,
+        original_tx_id=tx_id
+    )
+    
+    response = {
+        'message': f'Trip completion and ratings submitted to the pool as new TX {new_tx_id[:8]}. Escrow released. Waiting for block confirmation.',
+        'transaction_id': new_tx_id
+    }
+    return jsonify(response), 200
+
+@app.route('/driver/active_ride/<driver_id>', methods=['GET'])
+def get_driver_active_ride(driver_id):
+    """
+    Searches the entire chain and pending pool for the driver's most recent active trip.
+    Returns the transaction if status is RIDE_ACCEPTED_IN_PROGRESS or ESCROW_RELEASED_COMPLETED.
+    """
+    active_ride = None
+    
+    # 1. Check pending pool first (for acceptance/completion TX waiting to be mined)
+    for tx in blockchain.current_transactions:
+        if tx.get('driver_id') == driver_id and tx.get('status') in ['RIDE_ACCEPTED_IN_PROGRESS', 'ESCROW_RELEASED_COMPLETED']:
+            active_ride = tx
+            break
+            
+    # 2. If not found in the pool, check the entire chain (in reverse order for recency)
+    if not active_ride:
+        for block in reversed(blockchain.chain):
+            for tx in block['transactions']:
+                if tx.get('driver_id') == driver_id:
+                    status = tx.get('status')
+                    # Find the most recent transaction that is ACCEPTED or COMPLETED.
+                    if status in ['RIDE_ACCEPTED_IN_PROGRESS', 'ESCROW_RELEASED_COMPLETED']:
+                        # The trip is over and finalized if the status is COMPLETED.
+                        if status == 'ESCROW_RELEASED_COMPLETED':
+                            # We found a finalized trip. Don't show it as "active" 
+                            # unless it's the very last thing seen, 
+                            # but for the driver polling, we should break and return NONE 
+                            # if the most recent status is COMPLETED.
+                            return jsonify({'active_ride': None}), 200
+                            
+                        active_ride = tx
+                        break
+            if active_ride:
+                break # Break out of block loop
+
+    return jsonify({'active_ride': active_ride}), 200
+
+@app.route('/chain', methods=['GET'])
+def full_chain():
+    response = {
+        'chain': blockchain.chain,
+        'length': len(blockchain.chain),
+    }
+    return jsonify(response), 200
+
+@app.route('/reputation/<user_id>', methods=['GET'])
+def get_reputation(user_id):
+    reputation = blockchain.reputation_ledger.get(user_id, 3.0)
+    response = {'user_id': user_id, 'reputation': reputation}
+    return jsonify(response), 200
+
+if __name__ == '__main__':
+    # Initial manual mining of two blocks to ensure a smooth start
+    blockchain.new_block(proof=101, previous_hash=blockchain.hash(blockchain.last_block))
+    blockchain.new_block(proof=102, previous_hash=blockchain.hash(blockchain.last_block))
+
+    # Run the Flask app
+    app.run(host='127.0.0.1', port=5000)
