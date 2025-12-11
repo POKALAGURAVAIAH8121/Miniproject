@@ -14,7 +14,6 @@ Private Blockchain Network
 
 Proof of Authority (PoA) Consensus
 
-Login-Free User Access
 
 Smart Contract–Based Ride Agreements
 
