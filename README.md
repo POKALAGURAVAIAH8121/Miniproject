@@ -1,44 +1,70 @@
 ## Title of the Project
-Small description about the project like one below
-The integration of a chatbot within a hostel booking system, aimed at streamlining the reservation process for students and improving the overall user experience.
+
+Decentralized peer to peer Ride sharing System using Block Chain
 
 ## About
 <!--Detailed Description about the project-->
-Tailored Chatbot for Hostel Booking System is a project designed to integrate a chatbot that leverages advanced natural language processing techniques to understand and respond to user queries to the hostel booking system. Traditional hostel booking processes are often time-consuming and involve manual searches and extensive communication with hostel staff. This project seeks to overcome these challenges by creating an easy-to-use chatbot interface that assists students in addressing inquiries.
+Most current ride-sharing apps, including well-known ones such as Uber and Lyft, operate on centralized platforms where a central agency has access to all the user, ride, and payment information. The utilization of a central system has several disadvantages such as exorbitant fees, low transparency, compromised data privacy, and probable system crashes. As a response to such limitations, the present project offers an approach to a decentralized ride-sharing system built by using blockchain technology. It avoids middlemen in the form of direct "peer-to-peer (P2P) interactions" among drivers and passengers, promoting trust and fairness. It relies on a "private blockchain" that implements the "Proof of Authority (PoA)" consensus algorithm, which promises secure and efficient transaction verification with low computational overhead. The system facilitates login-free ride booking, “decentralized identity verification, and an escrow-based payment system with an integrated tamper-proof reputation system to guarantee reliability. By merging the immutability and transparency of blockchain with optimized P2P networking, the system ensures data integrity, fairness, and cost-effectiveness. In addition, it supports user autonomy through transparent and verifiable ride agreements, minimizing fraud and manipulation. “Decentralized in nature”, this solution provides a solid foundation for a scalable, secure, and community-driven ride-sharing ecosystem that can evolve with future innovations in mobility.
 
 ## Features
 <!--List the features of the project as shown below-->
-- Implements advance neural network method.
-- A framework based application for deployment purpose.
-- High scalability.
-- Less time complexity.
-- A specific scope of Chatbot response model, using json data format.
+Decentralized Peer-to-Peer Ride Sharing
 
+Private Blockchain Network
+
+Proof of Authority (PoA) Consensus
+
+Login-Free User Access
+
+Smart Contract–Based Ride Agreements
+
+Escrow-Protected Payments
+
+On-Chain Reputation System
+
+High Transparency and Security
+
+User Data Privacy
+
+Low Transaction Costs
 ## Requirements
 <!--List the requirements of the project as shown below-->
-* Operating System: Requires a 64-bit OS (Windows 10 or Ubuntu) for compatibility with deep learning frameworks.
-* Development Environment: Python 3.6 or later is necessary for coding the sign language detection system.
-* Deep Learning Frameworks: TensorFlow for model training, MediaPipe for hand gesture recognition.
-* Image Processing Libraries: OpenCV is essential for efficient image processing and real-time hand gesture recognition.
-* Version Control: Implementation of Git for collaborative development and effective code management.
-* IDE: Use of VSCode as the Integrated Development Environment for coding, debugging, and version control integration.
-* Additional Dependencies: Includes scikit-learn, TensorFlow (versions 2.4.1), TensorFlow GPU, OpenCV, and Mediapipe for deep learning tasks.
+- Use a private, permissioned blockchain with Proof-of-Authority (PoA) validators to record and validate all ride-related transactions. 
+
+- Support login-free ride booking by issuing cryptographic identities (public/private keys) to riders and drivers on first use.
+
+- Implement an escrow-based payment smart contract that locks fare funds at request time and releases them only after on-chain ride completion.
+
+- Model each trip as a multi-transaction state machine (ESCROW_PENDING → RIDE_ACCEPTED_IN_PROGRESS → ESCROW_RELEASED_COMPLETED) so every state change is an immutable chained transaction.
+
+- Maintain a tamper-proof, auditable reputation system where final ride ratings (included in the completion transaction) update an off-chain, verifiable reputation ledger derived from on-chain events.
+
+- Use SHA-256 hashing for block integrity, cryptographic signatures for action authenticity, and end-to-end encrypted P2P messaging between matched driver and rider.
+
+- Combine on-chain immutability with off-chain storage for high-performance lookups and scalability, and expose APIs/endpoints for ride creation, acceptance, completion, mining, and reputation queries.
 
 ## System Architecture
 <!--Embed the system architecture diagram as shown below-->
 
-![Screenshot 2023-11-25 133637](https://github.com/<<yourusername>>/Hand-Gesture-Recognition-System/assets/75235455/a60c11f3-0a11-47fb-ac89-755d5f45c995)
+<img width="1043" height="651" alt="image" src="https://github.com/user-attachments/assets/9929af6b-fa0b-4c2f-942d-3f5557ba2208" />
 
 
 ## Output
 
 <!--Embed the Output picture at respective places as shown below as shown below-->
-#### Output1 - Name of the output
+#### Output1 
 
-![Screenshot 2023-11-25 134037](https://github.com/<<yourusername>>/Hand-Gesture-Recognition-System/assets/75235455/8c2b6b5c-5ed2-4ec4-b18e-5b6625402c16)
+<img width="621" height="458" alt="image" src="https://github.com/user-attachments/assets/cc2559ab-4832-4a58-bd35-88494cab350c" />
 
-#### Output2 - Name of the output
-![Screenshot 2023-11-25 134253](https://github.com/<<yourusername>>/Hand-Gesture-Recognition-System/assets/75235455/5e05c981-05ca-4aaa-aea2-d918dcf25cb7)
+
+#### Output2 
+
+<img width="641" height="575" alt="image" src="https://github.com/user-attachments/assets/8ec046b1-7ea1-4821-9275-a9f82e1dd605" />
+
+#### Output3
+
+<img width="628" height="575" alt="image" src="https://github.com/user-attachments/assets/45f6c869-a03d-41de-86d2-084c4537880d" />
+
 
 Detection Accuracy: 96.7%
 Note: These metrics can be customized based on your actual performance evaluations.
@@ -46,13 +72,19 @@ Note: These metrics can be customized based on your actual performance evaluatio
 
 ## Results and Impact
 <!--Give the results and impact as shown below-->
-The Sign Language Detection System enhances accessibility for individuals with hearing and speech impairments, providing a valuable tool for inclusive communication. The project's integration of computer vision and deep learning showcases its potential for intuitive and interactive human-computer interaction.
+The system ensures secure and transparent ride transactions using blockchain technology.
+Proof of Authority consensus enables fast validation with minimal operational costs.
+Peer-to-peer ride matching removes intermediaries, fostering direct driver–rider trust.
+Private blockchain integration ensures data privacy and system reliability.
+Overall, it delivers a scalable, efficient, and trustworthy solution for digital ride-sharing.
 
-This project serves as a foundation for future developments in assistive technologies and contributes to creating a more inclusive and accessible digital environment.
+
+The system significantly enhances ride-sharing by increasing transparency, trust, and privacy while reducing costs through a decentralized, middleman-free model.
+
 
 ## Articles published / References
-1. N. S. Gupta, S. K. Rout, S. Barik, R. R. Kalangi, and B. Swampa, “Enhancing Heart Disease Prediction Accuracy Through Hybrid Machine Learning Methods ”, EAI Endorsed Trans IoT, vol. 10, Mar. 2024.
-2. A. A. BIN ZAINUDDIN, “Enhancing IoT Security: A Synergy of Machine Learning, Artificial Intelligence, and Blockchain”, Data Science Insights, vol. 2, no. 1, Feb. 2024.
+Klimis S. Ntalianis, Nikos E. Mastorakis, “Quality of Experience Oriented Eco-Friendly Taxi-Ride Sharing Recommendation Framework,” IEEE Access, Volume: 12, October 2024. DOI: 10.1109/ACCESS.2024.3485221.
+Yafei Li, Huiling Li, “Utility-Aware Dynamic Ridesharing in Spatial Crowdsourcing,” IEEE Transactions on Mobile Computing, Volume: 23, Issue: 2, February 2024. DOI: 10.1109/TMC.2022.3232215
 
 
 
